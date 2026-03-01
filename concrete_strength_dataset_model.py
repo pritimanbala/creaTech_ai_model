@@ -16,6 +16,7 @@ This module is tailored for datasets with columns like:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -52,6 +53,8 @@ MIX_FEATURE_COLUMNS: List[str] = [
 
 MODEL_FEATURE_COLUMNS: List[str] = MIX_FEATURE_COLUMNS + ["age_day"]
 TARGET_COLUMN = "concrete_strength_mpa"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,7 @@ class EarlyAgeStrengthPredictor:
 def load_and_standardize_dataset(data_path: str | Path) -> pd.DataFrame:
     """Load concrete CSV/XLSX and normalize headers into internal snake_case columns."""
     data_path = Path(data_path)
+    logger.info("Loading dataset from %s", data_path)
     suffix = data_path.suffix.lower()
     if suffix == ".csv":
         df = pd.read_csv(data_path)
@@ -102,6 +106,7 @@ def load_and_standardize_dataset(data_path: str | Path) -> pd.DataFrame:
     else:
         raise ValueError("Unsupported dataset format. Use .csv, .xlsx, or .xls")
 
+    logger.info("Loaded dataset with shape %s", df.shape)
     missing_raw = [c for c in RAW_TO_STANDARD_COLUMNS if c not in df.columns]
     if missing_raw:
         raise ValueError(
@@ -123,9 +128,11 @@ def train_strength_regressor_from_file(
     The trained model learns strength as a function of mix proportions + age_day.
     """
     output_model_path = Path(output_model_path)
+    logger.info("Starting model training from %s", data_path)
     output_model_path.parent.mkdir(parents=True, exist_ok=True)
 
     df = load_and_standardize_dataset(data_path)
+    logger.info("Standardized dataset rows=%d columns=%d", len(df), len(df.columns))
 
     X = df[MODEL_FEATURE_COLUMNS]
     y = df[TARGET_COLUMN]
@@ -156,9 +163,11 @@ def train_strength_regressor_from_file(
             ("model", model),
         ]
     )
+    logger.info("Fitting training pipeline")
     pipeline.fit(X, y)
 
     joblib.dump(pipeline, output_model_path)
+    logger.info("Saved trained model to %s", output_model_path)
 
     metrics_path = output_model_path.with_suffix(".metrics.txt")
     with metrics_path.open("w", encoding="utf-8") as f:
@@ -181,6 +190,7 @@ def train_strength_regressor_from_csv(
 
 def load_early_age_strength_predictor(model_path: str | Path) -> EarlyAgeStrengthPredictor:
     """Load persisted base model and wrap it for 8h/16h/24h prediction API."""
+    logger.info("Loading trained model from %s", model_path)
     base_model = joblib.load(model_path)
     return EarlyAgeStrengthPredictor(base_model=base_model)
 

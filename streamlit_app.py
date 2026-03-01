@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from datetime import date
+import logging
 from typing import Dict
 
 import pandas as pd
@@ -21,11 +22,22 @@ from precast_nsga2_optimization import (
 )
 
 st.set_page_config(page_title="Precast Order Planner", page_icon="🏗️", layout="wide")
+logger = logging.getLogger(__name__)
 
+
+
+
+def append_web_log(message: str) -> None:
+    if "web_logs" not in st.session_state:
+        st.session_state["web_logs"] = []
+    st.session_state["web_logs"].append(message)
+    logger.info(message)
 
 @st.cache_resource(show_spinner=False)
 def get_strength_model(data_path: str, model_path: str):
+    append_web_log(f"[MODEL] Checking model artifact at: {model_path}")
     model_file = ensure_trained_model(data_path=data_path, model_path=model_path)
+    append_web_log(f"[MODEL] Loading model from: {model_file}")
     return load_early_age_strength_predictor(model_file)
 
 
@@ -80,6 +92,7 @@ def render_results_table(result_map: Dict[str, Dict[str, float | str]]) -> pd.Da
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     st.title("🏗️ Precast Yard Order Planning Dashboard")
     st.caption("Model is trained once from concrete_data.xlsx, then loaded from saved artifact in future runs.")
 
@@ -106,10 +119,19 @@ def main() -> None:
 
     mix_features = build_mix_inputs()
 
+    st.markdown("### Process Console")
+    log_placeholder = st.empty()
+
+    if st.session_state.get("web_logs"):
+        log_placeholder.code("\n".join(st.session_state.get("web_logs", [])), language="text")
+
     if st.button("Generate Planning Pathways", type="primary"):
+        st.session_state["web_logs"] = []
         try:
             with st.spinner("Loading model and fetching 4-day weather..."):
+                append_web_log("[START] Beginning planning pipeline")
                 strength_model = get_strength_model(data_path=data_path, model_path=model_path)
+                append_web_log("[MODEL] Model ready")
                 order = OrderRequest(
                     units_ordered=int(units_ordered),
                     mold_volume_m3=float(mold_volume_m3),
@@ -124,8 +146,11 @@ def main() -> None:
                     molds_per_day_capacity=int(molds_per_day_capacity),
                     yard_size_available=int(yard_size_available),
                 )
+                append_web_log(f"[WEATHER] Fetching 4-day weather for lat={order.latitude}, lon={order.longitude}, date={order.order_date}")
                 climate: ClimateRecord = resolve_climate_from_api(order.latitude, order.longitude, order.order_date)
+                append_web_log(f"[WEATHER] Avg Temp={climate.ambient_temp_c:.2f}C Avg Humidity={climate.humidity_pct:.2f}%")
 
+                append_web_log("[PLANNER] Evaluating policies and computing pathways")
                 recommendations = recommend_three_paths(
                     strength_model=strength_model,
                     mix_features=mix_features,
@@ -134,7 +159,9 @@ def main() -> None:
                     climate=climate,
                     cost_cfg=CostConfig(),
                 )
+                append_web_log("[DONE] Recommendations generated")
 
+            log_placeholder.code("\n".join(st.session_state.get("web_logs", [])) or "No logs yet.", language="text")
             st.success("Recommendations generated successfully.")
             st.markdown("### Results")
             df = render_results_table(recommendations)
@@ -161,6 +188,8 @@ def main() -> None:
 """
             )
         except Exception as exc:  # noqa: BLE001
+            append_web_log(f"[ERROR] {exc}")
+            log_placeholder.code("\n".join(st.session_state.get("web_logs", [])), language="text")
             st.error(f"Unable to generate planning pathways: {exc}")
 
 

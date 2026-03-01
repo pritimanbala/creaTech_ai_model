@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import heapq
 import json
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,8 @@ from concrete_strength_dataset_model import (
     load_early_age_strength_predictor,
     train_strength_regressor_from_file,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,7 @@ def resolve_climate_from_api(
         "timezone": "auto",
     }
 
+    logger.info("Fetching weather data lat=%s lon=%s start=%s end=%s", latitude, longitude, start_date, end_date)
     response = requests.get(cfg.base_url, params=params, timeout=cfg.timeout_seconds)
     response.raise_for_status()
     payload = response.json()
@@ -111,10 +115,12 @@ def resolve_climate_from_api(
     if len(temps) < cfg.forecast_days or len(humidity) < cfg.forecast_days:
         raise ValueError("Weather API returned incomplete 4-day climate data")
 
-    return ClimateRecord(
+    climate = ClimateRecord(
         ambient_temp_c=float(np.mean(temps[: cfg.forecast_days])),
         humidity_pct=float(np.mean(humidity[: cfg.forecast_days])),
     )
+    logger.info("Resolved 4-day climate avg: temp=%.2fC humidity=%.2f%%", climate.ambient_temp_c, climate.humidity_pct)
+    return climate
 
 
 def compute_equivalent_age_factor(policy: ProcessPolicy, climate: ClimateRecord) -> float:
@@ -149,6 +155,7 @@ def find_min_time_to_strength_days(
             age_days=max(0.01, d * eq_age_factor),
         )
 
+    logger.info("Searching minimum curing time to reach %.3f MPa", required_strength_mpa)
     lo, hi = 0.0, 1.0
     while hi <= max_search_days and strength_at_actual_day(hi) < required_strength_mpa:
         hi *= 2.0
@@ -165,7 +172,9 @@ def find_min_time_to_strength_days(
         if (hi - lo) < tol_days:
             break
 
-    return float(hi)
+    result = float(hi)
+    logger.info("Estimated minimum curing days: %.4f", result)
+    return result
 
 
 def simulate_order_completion_days(
@@ -181,6 +190,7 @@ def simulate_order_completion_days(
     if yard_size_available <= 0:
         raise ValueError("yard_size_available must be > 0")
 
+    logger.info("Simulating throughput units=%d molds/day=%d yard=%d curing_days=%.3f", units_ordered, molds_per_day_capacity, yard_size_available, curing_days_per_unit)
     pending = int(units_ordered)
     in_progress_completion_heap: List[float] = []
     current_day = 0.0
@@ -205,6 +215,7 @@ def simulate_order_completion_days(
         else:
             current_day += 1.0
 
+    logger.info("Simulated order completion in %.3f days", float(last_completion))
     return float(last_completion)
 
 
@@ -237,7 +248,9 @@ def compute_total_cost(
     labor_multiplier = max(0.0, 1.0 - cost_cfg.labor_reduction_per_automation_level * policy.automation_level)
     labor_cost = completion_days * cost_cfg.base_labor_cost_per_day * labor_multiplier
 
-    return float(material_cost + energy_cost + yard_cost + labor_cost)
+    total = float(material_cost + energy_cost + yard_cost + labor_cost)
+    logger.info("Computed total cost %.2f for policy=%s", total, policy.name)
+    return total
 
 
 def evaluate_policy(
@@ -249,6 +262,7 @@ def evaluate_policy(
     climate: ClimateRecord,
     cost_cfg: CostConfig,
 ) -> Dict[str, float | str]:
+    logger.info("Evaluating policy: %s", policy.name)
     eq_factor = compute_equivalent_age_factor(policy, climate)
     curing_days_per_unit = find_min_time_to_strength_days(
         strength_model=strength_model,
@@ -265,7 +279,7 @@ def evaluate_policy(
     total_cost = compute_total_cost(mix_features, policy, order, total_completion_days, cost_cfg)
     completion_deviation_days = total_completion_days - order.completion_days_target
 
-    return {
+    result = {
         "policy_name": policy.name,
         "steam_temp_c": float(policy.steam_temp_c),
         "automation_level": float(policy.automation_level),
@@ -277,6 +291,8 @@ def evaluate_policy(
         "completion_deviation_days": float(completion_deviation_days),
         "total_cost": float(total_cost),
     }
+    logger.info("Policy %s -> completion %.3f days, cost %.2f", policy.name, result["total_completion_days"], result["total_cost"])
+    return result
 
 
 def recommend_three_paths(
@@ -316,18 +332,23 @@ def recommend_three_paths(
 
     balanced = min(evaluated, key=balanced_score)
 
-    return {
+    recommendations = {
         "fastest_path": dict(fastest),
         "balanced_path": dict(balanced),
         "cheapest_path": dict(cheapest),
     }
+    logger.info("Selected pathways: fastest=%s balanced=%s cheapest=%s", recommendations["fastest_path"]["policy_name"], recommendations["balanced_path"]["policy_name"], recommendations["cheapest_path"]["policy_name"])
+    return recommendations
 
 
 def ensure_trained_model(data_path: str | Path, model_path: str | Path) -> Path:
     """Train once if model is missing; otherwise reuse existing artifact."""
     model_file = Path(model_path)
     if not model_file.exists():
+        logger.info("No model found. Training from %s", data_path)
         train_strength_regressor_from_file(data_path=data_path, output_model_path=model_file)
+    else:
+        logger.info("Reusing existing model artifact at %s", model_file)
     return model_file
 
 
@@ -356,6 +377,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    logger.info("Starting precast planner execution")
     args = parse_args()
     model_file = ensure_trained_model(args.data, args.model_path)
     strength_model = load_early_age_strength_predictor(model_file)
@@ -404,6 +427,7 @@ def main() -> None:
             "4) Simulated throughput under molds/day and yard-size constraints and computed cost.",
         ],
     }
+    logger.info("Planner execution complete")
     print(json.dumps(output, indent=2))
 
 

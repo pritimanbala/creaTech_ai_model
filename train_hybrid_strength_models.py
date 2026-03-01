@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -25,6 +26,8 @@ from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBRegressor
 
 TARGET_COLUMNS = ["strength_8h", "strength_12h", "strength_24h"]
+
+logger = logging.getLogger(__name__)
 
 
 def parse_profile(values: object) -> np.ndarray:
@@ -119,6 +122,7 @@ def run_grid_search(model_pipeline: Pipeline, X_train: pd.DataFrame, y_train: pd
         n_jobs=-1,
         verbose=1,
     )
+    logger.info("Running grid search with %d folds for %d rows", cv_folds, len(X_train))
     grid.fit(X_train, y_train)
     return grid
 
@@ -176,6 +180,7 @@ def train_target_model(
     cv_folds: int,
 ) -> Dict[str, float]:
     """Train, tune, evaluate, and save artifacts for one target variable."""
+    logger.info("Preparing target model training for %s", target_column)
     local_df = df.dropna(subset=[target_column]).copy()
 
     X = local_df[feature_columns]
@@ -189,15 +194,18 @@ def train_target_model(
     )
 
     preprocessor, _, _ = build_preprocessor(X_train)
+    logger.info("Split sizes for %s -> train=%d test=%d", target_column, len(X_train), len(X_test))
     model_pipeline = build_model_pipeline(preprocessor)
     tuned = run_grid_search(model_pipeline, X_train, y_train, cv_folds)
     best_model = tuned.best_estimator_
 
     metrics = evaluate_model(best_model, X_test, y_test)
+    logger.info("Metrics for %s: RMSE=%.4f MAE=%.4f R2=%.4f", target_column, metrics["rmse"], metrics["mae"], metrics["r2"])
     metrics["cv_best_rmse"] = float(-tuned.best_score_)
 
     model_path = output_dir / f"{target_column}_xgb_pipeline.joblib"
     joblib.dump(best_model, model_path)
+    logger.info("Saved model for %s -> %s", target_column, model_path)
 
     importance_df = get_feature_importance(best_model)
     importance_df.to_csv(output_dir / f"{target_column}_feature_importance.csv", index=False)
@@ -215,6 +223,8 @@ def identify_feature_columns(df: pd.DataFrame, target_columns: Iterable[str], ex
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    logger.info("Starting hybrid model training script")
     parser = argparse.ArgumentParser(description="Train hybrid Physics + ML early-age concrete strength models.")
     parser.add_argument("--data", required=True, help="Path to input CSV dataset.")
     parser.add_argument("--output-dir", default="artifacts", help="Directory to save model artifacts.")
@@ -233,9 +243,12 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.info("Loading training dataset from %s", args.data)
     df = pd.read_csv(args.data)
+    logger.info("Dataset loaded with shape %s", df.shape)
 
     dt_col_exists = args.dt_profile_column in df.columns
+    logger.info("Computing Nurse-Saul maturity index")
     df["maturity_index"] = df.apply(
         lambda row: compute_nurse_saul_maturity(
             temperature_profile=row[args.temp_profile_column],
@@ -251,6 +264,7 @@ def main() -> None:
         dropped_source_columns.append(args.dt_profile_column)
 
     feature_columns = identify_feature_columns(df, TARGET_COLUMNS, dropped_source_columns)
+    logger.info("Identified %d feature columns", len(feature_columns))
 
     summary: Dict[str, Dict[str, float]] = {}
     for target in TARGET_COLUMNS:
@@ -269,6 +283,7 @@ def main() -> None:
         )
         summary[target] = metrics
 
+    logger.info("Writing metrics summary to %s", output_dir / "metrics_summary.json")
     with (output_dir / "metrics_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, List
 
 import joblib
 import numpy as np
@@ -91,9 +91,16 @@ class EarlyAgeStrengthPredictor:
         return stacked
 
 
-def load_and_standardize_dataset(csv_path: str | Path) -> pd.DataFrame:
-    """Load concrete CSV and normalize headers into internal snake_case columns."""
-    df = pd.read_csv(csv_path)
+def load_and_standardize_dataset(data_path: str | Path) -> pd.DataFrame:
+    """Load concrete CSV/XLSX and normalize headers into internal snake_case columns."""
+    data_path = Path(data_path)
+    suffix = data_path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(data_path)
+    elif suffix in {".xlsx", ".xls"}:
+        df = pd.read_excel(data_path)
+    else:
+        raise ValueError("Unsupported dataset format. Use .csv, .xlsx, or .xls")
 
     missing_raw = [c for c in RAW_TO_STANDARD_COLUMNS if c not in df.columns]
     if missing_raw:
@@ -107,18 +114,18 @@ def load_and_standardize_dataset(csv_path: str | Path) -> pd.DataFrame:
     return standardized
 
 
-def train_strength_regressor_from_csv(
-    csv_path: str | Path,
+def train_strength_regressor_from_file(
+    data_path: str | Path,
     output_model_path: str | Path = "artifacts/concrete_strength_age_model.joblib",
 ) -> TrainingArtifacts:
-    """Train a concrete-strength regressor from concrete_data.csv format.
+    """Train a concrete-strength regressor from concrete_data file.
 
     The trained model learns strength as a function of mix proportions + age_day.
     """
     output_model_path = Path(output_model_path)
     output_model_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df = load_and_standardize_dataset(csv_path)
+    df = load_and_standardize_dataset(data_path)
 
     X = df[MODEL_FEATURE_COLUMNS]
     y = df[TARGET_COLUMN]
@@ -161,6 +168,17 @@ def train_strength_regressor_from_csv(
     return TrainingArtifacts(model_path=output_model_path, metrics_path=metrics_path)
 
 
+def train_strength_regressor_from_csv(
+    csv_path: str | Path,
+    output_model_path: str | Path = "artifacts/concrete_strength_age_model.joblib",
+) -> TrainingArtifacts:
+    """Backward-compatible wrapper for CSV-specific naming."""
+    return train_strength_regressor_from_file(
+        data_path=csv_path,
+        output_model_path=output_model_path,
+    )
+
+
 def load_early_age_strength_predictor(model_path: str | Path) -> EarlyAgeStrengthPredictor:
     """Load persisted base model and wrap it for 8h/16h/24h prediction API."""
     base_model = joblib.load(model_path)
@@ -175,6 +193,7 @@ __all__ = [
     "EarlyAgeStrengthPredictor",
     "TrainingArtifacts",
     "load_and_standardize_dataset",
+    "train_strength_regressor_from_file",
     "train_strength_regressor_from_csv",
     "load_early_age_strength_predictor",
 ]

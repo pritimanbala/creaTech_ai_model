@@ -1,19 +1,31 @@
-# Precast Order Planning with `concrete_data.csv`
+# Precast Order Planning Dashboard
 
-This repository now supports model-driven order planning for precast production.
+This project provides a production planning system for precast operations using a trained concrete strength model.
 
-## What the system can do
+## Key behavior now
 
-1. Train a concrete strength model from `concrete_data.csv`.
-2. Estimate the **actual minimum curing time** to reach a required strength (not capped at 48 hours).
-3. Respect day/hour conversion explicitly (`1 day = 24 hours`).
-4. Simulate production with real constraints:
-   - molds produced per day
-   - total yard space available (concurrent molds in curing)
-5. Return **three decision pathways** for an order:
-   - fastest path
-   - balanced speed/cost path
-   - cheapest path
+1. **First run training only**
+   - The app/CLI trains a model from `concrete_data.xlsx` (or `.csv`) only when model artifact does not exist.
+   - Next runs load the saved model directly (no retraining during normal user flow).
+
+2. **Model-driven curing time**
+   - Finds actual minimum curing time needed to reach required strength.
+   - No 48-hour hard cap.
+   - Uses strict hour/day conversion (`1 day = 24 hours`).
+
+3. **Weather from latitude/longitude**
+   - Takes latitude + longitude as input.
+   - Calls Open-Meteo API for next 4 days from selected date.
+   - Uses average temperature and humidity from those 4 days.
+
+4. **Yard-aware scheduling**
+   - Uses molds/day + yard-size occupancy constraints.
+   - Captures waiting behavior when yard is full.
+
+5. **Three pathways output**
+   - Fastest
+   - Balanced
+   - Cheapest
 
 ## Dataset schema expected
 
@@ -27,60 +39,48 @@ This repository now supports model-driven order planning for precast production.
 - Age (day)
 - Concrete compressive strength(MPa, megapascals)
 
-## Run planning
+## Streamlit app
+
+```bash
+streamlit run streamlit_app.py
+```
+
+In the dashboard, provide:
+- units ordered
+- mold volume
+- mold area
+- completion days
+- required strength
+- latitude and longitude
+- order date
+- yard size available
+- molds produced per day
+- mix design values
+
+The dashboard displays:
+- 4-day average weather used
+- pathway comparison table
+- completion-time chart
+- cost chart
+- planning logic
+
+## CLI usage
 
 ```bash
 python precast_nsga2_optimization.py \
-  --data concrete_data.csv \
+  --data concrete_data.xlsx \
   --model-path artifacts/concrete_strength_age_model.joblib \
-  --retrain-model \
   --units-ordered 20 \
   --mold-volume 1.0 \
   --mold-area 2.2 \
   --required-strength 9 \
   --completion-days 4 \
-  --location chennai \
+  --latitude 13.0827 \
+  --longitude 80.2707 \
   --date 2026-03-01 \
   --yard-size 150 \
   --molds-per-day 50 \
   --mix-json '{"cement_kg":300,"blast_furnace_slag_kg":120,"fly_ash_kg":60,"water_kg":180,"superplasticizer_kg":8,"coarse_aggregate_kg":950,"fine_aggregate_kg":780}'
 ```
 
-Optional:
-
-- `--climate-csv climate_lookup.csv` with columns: `location,date,ambient_temp_c,humidity_pct`
-
-## Output
-
-JSON output includes:
-- full input summary
-- recommended paths (`fastest_path`, `balanced_path`, `cheapest_path`)
-- each path's curing time, completion time, deviation vs target, and total cost
-- pathway logic used by the planner
-
-## Streamlit Web Application
-
-A UI is available to enter the order inputs and get recommended pathways.
-
-Run:
-
-```bash
-streamlit run streamlit_app.py
-```
-
-In the app, users can provide:
-- units ordered
-- mold volume
-- mold area
-- completion days target
-- location
-- yard size available
-- date (for climate)
-- molds per day capacity
-- mix design variables
-
-Output includes:
-- fastest path
-- balanced path
-- cheapest path
-- completion deviation and total cost for each pathway
+The command prints JSON with full input summary, climate averages, and all three recommended pathways.

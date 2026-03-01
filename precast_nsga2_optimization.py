@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Production planning and optimization for precast yard operations.
-
-This module extends strength modeling into order-level planning.
-Key capabilities:
-- Estimate *actual minimum curing time* to reach required strength (no 48h cap).
-- Convert hour/day values safely and consistently.
-- Model throughput constraints: daily mold capacity + yard space limits.
-- Produce three actionable pathways: fastest, balanced, cheapest.
-"""
+"""Production planning and optimization for precast yard operations."""
 
 from __future__ import annotations
 
@@ -15,23 +7,19 @@ import argparse
 import heapq
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import requests
 
 from concrete_strength_dataset_model import (
     MIX_FEATURE_COLUMNS,
     load_early_age_strength_predictor,
-    train_strength_regressor_from_csv,
+    train_strength_regressor_from_file,
 )
-
-
-# -------------------------
-# Domain Configuration
-# -------------------------
 
 
 @dataclass(frozen=True)
@@ -58,7 +46,8 @@ class OrderRequest:
     mold_area_m2: float
     required_strength_mpa: float
     completion_days_target: float
-    location: str
+    latitude: float
+    longitude: float
     order_date: date
 
 
@@ -76,9 +65,11 @@ class ProcessPolicy:
     curing_duration_hours_per_day: float
 
 
-# -------------------------
-# Utility / conversions
-# -------------------------
+@dataclass(frozen=True)
+class WeatherApiConfig:
+    base_url: str = "https://api.open-meteo.com/v1/forecast"
+    forecast_days: int = 4
+    timeout_seconds: float = 20.0
 
 
 def hours_to_days(hours: float) -> float:
@@ -89,42 +80,44 @@ def days_to_hours(days: float) -> float:
     return float(days) * 24.0
 
 
-# -------------------------
-# Strength-time estimation
-# -------------------------
+def resolve_climate_from_api(
+    latitude: float,
+    longitude: float,
+    order_date: date,
+    weather_cfg: WeatherApiConfig | None = None,
+) -> ClimateRecord:
+    """Fetch 4-day weather forecast and return mean temp/humidity."""
+    cfg = weather_cfg or WeatherApiConfig()
 
+    start_date = order_date
+    end_date = start_date + timedelta(days=cfg.forecast_days - 1)
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "daily": "temperature_2m_mean,relative_humidity_2m_mean",
+        "timezone": "auto",
+    }
 
-def resolve_climate(location: str, order_date: date, climate_csv: str | None = None) -> ClimateRecord:
-    """Resolve climate from optional dataset; otherwise use robust defaults.
+    response = requests.get(cfg.base_url, params=params, timeout=cfg.timeout_seconds)
+    response.raise_for_status()
+    payload = response.json()
 
-    Expected optional CSV columns: location, date, ambient_temp_c, humidity_pct
-    where date is ISO format (YYYY-MM-DD).
-    """
-    if climate_csv and Path(climate_csv).exists():
-        climate_df = pd.read_csv(climate_csv)
-        expected = {"location", "date", "ambient_temp_c", "humidity_pct"}
-        if expected.issubset(set(climate_df.columns)):
-            date_str = order_date.isoformat()
-            subset = climate_df[
-                (climate_df["location"].astype(str).str.lower() == str(location).lower())
-                & (climate_df["date"].astype(str) == date_str)
-            ]
-            if not subset.empty:
-                row = subset.iloc[0]
-                return ClimateRecord(
-                    ambient_temp_c=float(row["ambient_temp_c"]),
-                    humidity_pct=float(row["humidity_pct"]),
-                )
+    daily = payload.get("daily", {})
+    temps = daily.get("temperature_2m_mean") or []
+    humidity = daily.get("relative_humidity_2m_mean") or []
 
-    return ClimateRecord(ambient_temp_c=25.0, humidity_pct=60.0)
+    if len(temps) < cfg.forecast_days or len(humidity) < cfg.forecast_days:
+        raise ValueError("Weather API returned incomplete 4-day climate data")
+
+    return ClimateRecord(
+        ambient_temp_c=float(np.mean(temps[: cfg.forecast_days])),
+        humidity_pct=float(np.mean(humidity[: cfg.forecast_days])),
+    )
 
 
 def compute_equivalent_age_factor(policy: ProcessPolicy, climate: ClimateRecord) -> float:
-    """Convert actual time into equivalent-age multiplier.
-
-    The factor accelerates/slows effective hydration age based on process + climate.
-    It is intentionally bounded to maintain numerical stability.
-    """
     steam_term = 1.0 + 0.012 * max(0.0, policy.steam_temp_c - 20.0)
     curing_term = 0.8 + 0.2 * np.clip(policy.curing_duration_hours_per_day / 24.0, 0.0, 1.0)
     temp_term = 1.0 + 0.01 * (climate.ambient_temp_c - 20.0)
@@ -134,12 +127,7 @@ def compute_equivalent_age_factor(policy: ProcessPolicy, climate: ClimateRecord)
     return float(np.clip(raw, 0.5, 3.0))
 
 
-def predict_strength_at_age_days(
-    strength_model: Any,
-    mix_features: Mapping[str, float],
-    age_days: float,
-) -> float:
-    """Predict strength at a specific age (days) for a given mix."""
+def predict_strength_at_age_days(strength_model: Any, mix_features: Mapping[str, float], age_days: float) -> float:
     row = {col: float(mix_features[col]) for col in MIX_FEATURE_COLUMNS}
     row["age_day"] = float(age_days)
     pred = np.asarray(strength_model.base_model.predict(pd.DataFrame([row])), dtype=float).reshape(-1)
@@ -151,16 +139,9 @@ def find_min_time_to_strength_days(
     mix_features: Mapping[str, float],
     required_strength_mpa: float,
     eq_age_factor: float,
-    max_search_days: float = 60.0,
+    max_search_days: float = 120.0,
     tol_days: float = 1e-3,
 ) -> float:
-    """Find minimum *actual* days required to achieve strength.
-
-    Uses bisection over actual age while querying model at equivalent age:
-    equivalent_age = actual_age * eq_age_factor
-
-    No hard 48-hour stress cap is applied; search extends to `max_search_days`.
-    """
     def strength_at_actual_day(d: float) -> float:
         return predict_strength_at_age_days(
             strength_model=strength_model,
@@ -174,8 +155,6 @@ def find_min_time_to_strength_days(
 
     if hi > max_search_days:
         hi = max_search_days
-        if strength_at_actual_day(hi) < required_strength_mpa:
-            return float(max_search_days)
 
     for _ in range(80):
         mid = 0.5 * (lo + hi)
@@ -189,22 +168,12 @@ def find_min_time_to_strength_days(
     return float(hi)
 
 
-# -------------------------
-# Throughput-constrained planning
-# -------------------------
-
-
 def simulate_order_completion_days(
     units_ordered: int,
     curing_days_per_unit: float,
     molds_per_day_capacity: int,
     yard_size_available: int,
 ) -> float:
-    """Simulate completion with daily start limit + yard occupancy limit.
-
-    If each mold needs several days in curing, occupied yard slots block new starts
-    until earlier molds are released. This captures the bottleneck behavior requested.
-    """
     if units_ordered <= 0:
         return 0.0
     if molds_per_day_capacity <= 0:
@@ -239,11 +208,6 @@ def simulate_order_completion_days(
     return float(last_completion)
 
 
-# -------------------------
-# Cost & scenario evaluation
-# -------------------------
-
-
 def compute_total_cost(
     mix_features: Mapping[str, float],
     policy: ProcessPolicy,
@@ -251,7 +215,6 @@ def compute_total_cost(
     completion_days: float,
     cost_cfg: CostConfig,
 ) -> float:
-    """Compute total order cost for a plan."""
     cement_total_kg = float(mix_features["cement_kg"]) * order.mold_volume_m3 * order.units_ordered
     flyash_total_kg = float(mix_features["fly_ash_kg"]) * order.mold_volume_m3 * order.units_ordered
     admixture_total_kg = float(mix_features["superplasticizer_kg"]) * order.mold_volume_m3 * order.units_ordered
@@ -286,7 +249,6 @@ def evaluate_policy(
     climate: ClimateRecord,
     cost_cfg: CostConfig,
 ) -> Dict[str, float | str]:
-    """Evaluate one process policy and return KPI bundle."""
     eq_factor = compute_equivalent_age_factor(policy, climate)
     curing_days_per_unit = find_min_time_to_strength_days(
         strength_model=strength_model,
@@ -294,22 +256,13 @@ def evaluate_policy(
         required_strength_mpa=order.required_strength_mpa,
         eq_age_factor=eq_factor,
     )
-
     total_completion_days = simulate_order_completion_days(
         units_ordered=order.units_ordered,
         curing_days_per_unit=curing_days_per_unit,
         molds_per_day_capacity=plant.molds_per_day_capacity,
         yard_size_available=plant.yard_size_available,
     )
-
-    total_cost = compute_total_cost(
-        mix_features=mix_features,
-        policy=policy,
-        order=order,
-        completion_days=total_completion_days,
-        cost_cfg=cost_cfg,
-    )
-
+    total_cost = compute_total_cost(mix_features, policy, order, total_completion_days, cost_cfg)
     completion_deviation_days = total_completion_days - order.completion_days_target
 
     return {
@@ -319,6 +272,7 @@ def evaluate_policy(
         "curing_duration_hours_per_day": float(policy.curing_duration_hours_per_day),
         "equivalent_age_factor": float(eq_factor),
         "min_curing_days_per_unit": float(curing_days_per_unit),
+        "min_curing_hours_per_unit": float(days_to_hours(curing_days_per_unit)),
         "total_completion_days": float(total_completion_days),
         "completion_deviation_days": float(completion_deviation_days),
         "total_cost": float(total_cost),
@@ -333,9 +287,7 @@ def recommend_three_paths(
     climate: ClimateRecord,
     cost_cfg: CostConfig | None = None,
 ) -> Dict[str, Dict[str, float | str]]:
-    """Return fastest, balanced, and cheapest pathways with transparent metrics."""
     cfg = cost_cfg or CostConfig()
-
     candidate_policies = [
         ProcessPolicy("fast-track", steam_temp_c=80.0, automation_level=4.0, curing_duration_hours_per_day=20.0),
         ProcessPolicy("balanced", steam_temp_c=60.0, automation_level=2.0, curing_duration_hours_per_day=16.0),
@@ -343,15 +295,7 @@ def recommend_three_paths(
     ]
 
     evaluated = [
-        evaluate_policy(
-            strength_model=strength_model,
-            mix_features=mix_features,
-            order=order,
-            plant=plant,
-            policy=policy,
-            climate=climate,
-            cost_cfg=cfg,
-        )
+        evaluate_policy(strength_model, mix_features, order, plant, policy, climate, cfg)
         for policy in candidate_policies
     ]
 
@@ -379,46 +323,42 @@ def recommend_three_paths(
     }
 
 
-# -------------------------
-# CLI
-# -------------------------
+def ensure_trained_model(data_path: str | Path, model_path: str | Path) -> Path:
+    """Train once if model is missing; otherwise reuse existing artifact."""
+    model_file = Path(model_path)
+    if not model_file.exists():
+        train_strength_regressor_from_file(data_path=data_path, output_model_path=model_file)
+    return model_file
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Order-level precast planning with model-driven curing time.")
-    parser.add_argument("--data", default="concrete_data.csv", help="Dataset path (concrete_data.csv schema).")
+    parser.add_argument("--data", default="concrete_data.xlsx", help="Dataset path (.xlsx/.csv) used for first-time training only.")
     parser.add_argument("--model-path", default="artifacts/concrete_strength_age_model.joblib", help="Trained model path.")
-    parser.add_argument("--retrain-model", action="store_true", help="Retrain model from --data before planning.")
 
     parser.add_argument("--units-ordered", type=int, required=True)
     parser.add_argument("--mold-volume", type=float, required=True, help="m^3 per mold")
     parser.add_argument("--mold-area", type=float, required=True, help="m^2 per mold")
     parser.add_argument("--required-strength", type=float, required=True, help="MPa")
     parser.add_argument("--completion-days", type=float, required=True)
-    parser.add_argument("--location", type=str, required=True)
+    parser.add_argument("--latitude", type=float, required=True)
+    parser.add_argument("--longitude", type=float, required=True)
     parser.add_argument("--date", type=str, required=True, help="YYYY-MM-DD")
     parser.add_argument("--yard-size", type=int, required=True)
     parser.add_argument("--molds-per-day", type=int, required=True)
-    parser.add_argument("--climate-csv", type=str, default=None, help="Optional climate lookup CSV")
-
     parser.add_argument(
         "--mix-json",
         type=str,
         required=True,
-        help="JSON string with mix features using keys: cement_kg, blast_furnace_slag_kg, fly_ash_kg, water_kg, superplasticizer_kg, coarse_aggregate_kg, fine_aggregate_kg",
+        help="JSON string with mix features keys: cement_kg, blast_furnace_slag_kg, fly_ash_kg, water_kg, superplasticizer_kg, coarse_aggregate_kg, fine_aggregate_kg",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    model_path = Path(args.model_path)
-
-    if args.retrain_model or not model_path.exists():
-        artifacts = train_strength_regressor_from_csv(args.data, output_model_path=model_path)
-        print(f"Trained model -> {artifacts.model_path}")
-
-    strength_model = load_early_age_strength_predictor(model_path)
+    model_file = ensure_trained_model(args.data, args.model_path)
+    strength_model = load_early_age_strength_predictor(model_file)
 
     order_dt = datetime.strptime(args.date, "%Y-%m-%d").date()
     order = OrderRequest(
@@ -427,7 +367,8 @@ def main() -> None:
         mold_area_m2=args.mold_area,
         required_strength_mpa=args.required_strength,
         completion_days_target=args.completion_days,
-        location=args.location,
+        latitude=args.latitude,
+        longitude=args.longitude,
         order_date=order_dt,
     )
     plant = PlantConfig(molds_per_day_capacity=args.molds_per_day, yard_size_available=args.yard_size)
@@ -437,40 +378,32 @@ def main() -> None:
     if missing:
         raise ValueError(f"mix_json missing keys: {missing}")
 
-    climate = resolve_climate(args.location, order_dt, climate_csv=args.climate_csv)
-
-    recommendations = recommend_three_paths(
-        strength_model=strength_model,
-        mix_features=mix_features,
-        order=order,
-        plant=plant,
-        climate=climate,
-    )
+    climate = resolve_climate_from_api(order.latitude, order.longitude, order.order_date)
+    recommendations = recommend_three_paths(strength_model, mix_features, order, plant, climate)
 
     output = {
         "input_summary": {
             "units_ordered": order.units_ordered,
             "completion_days_target": order.completion_days_target,
             "required_strength_mpa": order.required_strength_mpa,
-            "location": order.location,
+            "latitude": order.latitude,
+            "longitude": order.longitude,
             "order_date": order.order_date.isoformat(),
             "molds_per_day_capacity": plant.molds_per_day_capacity,
             "yard_size_available": plant.yard_size_available,
-            "climate": {
+            "climate_4day_average": {
                 "ambient_temp_c": climate.ambient_temp_c,
                 "humidity_pct": climate.humidity_pct,
             },
-            "hour_day_conversion_note": "All optimization time is in days. Where hourly settings exist (e.g., curing_duration_hours_per_day), conversion uses day = 24 hours.",
         },
         "recommended_paths": recommendations,
         "pathway_logic": [
-            "1) Estimated minimum curing days per unit from model using equivalent-age factor.",
-            "2) Simulated order completion under molds/day and yard-space constraints.",
-            "3) Computed total cost from materials + energy + yard holding + labor automation effect.",
-            "4) Selected fastest, balanced, and cheapest among policy candidates.",
+            "1) Model trained only on first run if artifact is absent, then reused.",
+            "2) Pulled 4-day weather forecast using latitude/longitude and averaged temperature+humidity.",
+            "3) Estimated minimum curing days from model and equivalent-age factor.",
+            "4) Simulated throughput under molds/day and yard-size constraints and computed cost.",
         ],
     }
-
     print(json.dumps(output, indent=2))
 
 

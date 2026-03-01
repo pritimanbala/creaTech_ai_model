@@ -1,39 +1,31 @@
 #!/usr/bin/env python3
-"""Streamlit UI for precast order planning.
-
-This app captures user inputs and displays three recommendation pathways:
-- Fastest
-- Balanced
-- Cheapest
-"""
+"""Streamlit UI for precast order planning."""
 
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 from typing import Dict
 
 import pandas as pd
 import streamlit as st
 
-from concrete_strength_dataset_model import MIX_FEATURE_COLUMNS, load_early_age_strength_predictor, train_strength_regressor_from_csv
+from concrete_strength_dataset_model import MIX_FEATURE_COLUMNS, load_early_age_strength_predictor
 from precast_nsga2_optimization import (
     ClimateRecord,
     CostConfig,
     OrderRequest,
     PlantConfig,
+    ensure_trained_model,
     recommend_three_paths,
-    resolve_climate,
+    resolve_climate_from_api,
 )
 
 st.set_page_config(page_title="Precast Order Planner", page_icon="🏗️", layout="wide")
 
 
 @st.cache_resource(show_spinner=False)
-def get_strength_model(data_path: str, model_path: str, retrain: bool):
-    model_file = Path(model_path)
-    if retrain or not model_file.exists():
-        train_strength_regressor_from_csv(csv_path=data_path, output_model_path=model_file)
+def get_strength_model(data_path: str, model_path: str):
+    model_file = ensure_trained_model(data_path=data_path, model_path=model_path)
     return load_early_age_strength_predictor(model_file)
 
 
@@ -52,7 +44,7 @@ def build_mix_inputs() -> Dict[str, float]:
     with c4:
         fine_aggregate_kg = st.number_input("Fine Aggregate", min_value=0.0, value=780.0, step=1.0)
 
-    mix = {
+    return {
         "cement_kg": cement_kg,
         "blast_furnace_slag_kg": blast_furnace_slag_kg,
         "fly_ash_kg": fly_ash_kg,
@@ -61,10 +53,9 @@ def build_mix_inputs() -> Dict[str, float]:
         "coarse_aggregate_kg": coarse_aggregate_kg,
         "fine_aggregate_kg": fine_aggregate_kg,
     }
-    return mix
 
 
-def render_results_table(result_map: Dict[str, Dict[str, float | str]]) -> None:
+def render_results_table(result_map: Dict[str, Dict[str, float | str]]) -> pd.DataFrame:
     rows = []
     for key, payload in result_map.items():
         rows.append(
@@ -76,6 +67,7 @@ def render_results_table(result_map: Dict[str, Dict[str, float | str]]) -> None:
                 "Curing Hours/Day": payload["curing_duration_hours_per_day"],
                 "Equivalent Age Factor": payload["equivalent_age_factor"],
                 "Min Curing Days/Unit": payload["min_curing_days_per_unit"],
+                "Min Curing Hours/Unit": payload["min_curing_hours_per_unit"],
                 "Total Completion Days": payload["total_completion_days"],
                 "Deviation vs Target (days)": payload["completion_deviation_days"],
                 "Total Cost": payload["total_cost"],
@@ -84,16 +76,16 @@ def render_results_table(result_map: Dict[str, Dict[str, float | str]]) -> None:
 
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True)
+    return df
 
 
 def main() -> None:
-    st.title("🏗️ Precast Yard Order Planning")
-    st.caption("Model-driven planning from concrete_data.csv with fastest, balanced, and cheapest pathways.")
+    st.title("🏗️ Precast Yard Order Planning Dashboard")
+    st.caption("Model is trained once from concrete_data.xlsx, then loaded from saved artifact in future runs.")
 
     st.sidebar.header("Model Configuration")
-    data_path = st.sidebar.text_input("Training data path", value="concrete_data.csv")
+    data_path = st.sidebar.text_input("Initial training data path", value="concrete_data.xlsx")
     model_path = st.sidebar.text_input("Model artifact path", value="artifacts/concrete_strength_age_model.joblib")
-    retrain_model = st.sidebar.checkbox("Retrain model before run", value=False)
 
     st.subheader("Order Inputs")
     left, right = st.columns(2)
@@ -106,47 +98,33 @@ def main() -> None:
         required_strength_mpa = st.number_input("Required Strength (MPa)", min_value=0.1, value=9.0, step=0.1)
 
     with right:
-        location = st.text_input("Location", value="chennai")
-        order_date = st.date_input("Date (for climatic conditions)", value=date.today())
+        latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=13.0827, step=0.0001)
+        longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=80.2707, step=0.0001)
+        order_date = st.date_input("Date (for 4-day weather average)", value=date.today())
         yard_size_available = st.number_input("Yard Size Available (molds)", min_value=1, value=150, step=1)
         molds_per_day_capacity = st.number_input("Molds Produced per Day", min_value=1, value=50, step=1)
-        climate_csv = st.text_input("Optional climate CSV", value="")
 
     mix_features = build_mix_inputs()
 
     if st.button("Generate Planning Pathways", type="primary"):
-        missing_keys = [col for col in MIX_FEATURE_COLUMNS if col not in mix_features]
-        if missing_keys:
-            st.error(f"Missing mix fields: {missing_keys}")
-            return
-
         try:
-            with st.spinner("Loading/training model and computing recommendations..."):
-                strength_model = get_strength_model(
-                    data_path=data_path,
-                    model_path=model_path,
-                    retrain=retrain_model,
-                )
-
+            with st.spinner("Loading model and fetching 4-day weather..."):
+                strength_model = get_strength_model(data_path=data_path, model_path=model_path)
                 order = OrderRequest(
                     units_ordered=int(units_ordered),
                     mold_volume_m3=float(mold_volume_m3),
                     mold_area_m2=float(mold_area_m2),
                     required_strength_mpa=float(required_strength_mpa),
                     completion_days_target=float(completion_days_target),
-                    location=str(location),
+                    latitude=float(latitude),
+                    longitude=float(longitude),
                     order_date=order_date,
                 )
                 plant = PlantConfig(
                     molds_per_day_capacity=int(molds_per_day_capacity),
                     yard_size_available=int(yard_size_available),
                 )
-
-                climate: ClimateRecord = resolve_climate(
-                    location=location,
-                    order_date=order_date,
-                    climate_csv=climate_csv or None,
-                )
+                climate: ClimateRecord = resolve_climate_from_api(order.latitude, order.longitude, order.order_date)
 
                 recommendations = recommend_three_paths(
                     strength_model=strength_model,
@@ -159,18 +137,29 @@ def main() -> None:
 
             st.success("Recommendations generated successfully.")
             st.markdown("### Results")
-            render_results_table(recommendations)
+            df = render_results_table(recommendations)
+
+            st.markdown("### Climate Used (4-day Average)")
+            st.metric("Mean Temperature (°C)", f"{climate.ambient_temp_c:.2f}")
+            st.metric("Mean Humidity (%)", f"{climate.humidity_pct:.2f}")
+
+            st.markdown("### Dashboard Views")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.bar_chart(df.set_index("Path")[["Total Completion Days"]])
+            with c2:
+                st.bar_chart(df.set_index("Path")[["Total Cost"]])
 
             st.markdown("### Pathway Logic")
             st.markdown(
                 """
-1. Estimate minimum curing days per unit from the trained strength model.
-2. Apply climate/process equivalent-age effect.
-3. Simulate completion under molds/day and yard-space constraints.
-4. Compute total cost and rank paths as fastest, balanced, and cheapest.
+1. Train model only on first run if artifact is missing, then always reuse the saved model.
+2. Fetch weather forecast for 4 days from latitude/longitude and compute average temperature and humidity.
+3. Estimate minimum curing time from model and convert using equivalent-age factor.
+4. Simulate throughput with daily mold production and yard occupancy limits.
+5. Report fastest, balanced, and cheapest pathways.
 """
             )
-
         except Exception as exc:  # noqa: BLE001
             st.error(f"Unable to generate planning pathways: {exc}")
 

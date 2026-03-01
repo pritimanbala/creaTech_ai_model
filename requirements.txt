@@ -6,3 +6,5 @@ pymoo
 xgboost
 shap
 streamlit
+requests
+openpyxl

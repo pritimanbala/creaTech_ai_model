@@ -37,7 +37,7 @@ This project provides a production planning system for precast operations using 
 - Coarse Aggregate  (component 6)(kg in a m^3 mixture)
 - Fine Aggregate (component 7)(kg in a m^3 mixture)
 - Age (day)
-- Concrete compressive strength(MPa, megapascals)
+- Concrete compressive strength(MPa)
 
 ## Streamlit app
 

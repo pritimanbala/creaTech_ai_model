@@ -1,0 +1,11 @@
+# Virtual environments
+.env/
+env/
+myenv/
+.venv/
+
+# Python cache
+__pycache__/
+
+# Project artifacts
+artifacts/

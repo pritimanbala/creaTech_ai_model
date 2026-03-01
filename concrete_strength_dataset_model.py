@@ -10,7 +10,7 @@ This module is tailored for datasets with columns like:
 - Coarse Aggregate  (component 6)(kg in a m^3 mixture)
 - Fine Aggregate (component 7)(kg in a m^3 mixture)
 - Age (day)
-- Concrete compressive strength(MPa, megapascals)
+- Concrete compressive strength(MPa)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ RAW_TO_STANDARD_COLUMNS: Dict[str, str] = {
     "Coarse Aggregate  (component 6)(kg in a m^3 mixture)": "coarse_aggregate_kg",
     "Fine Aggregate (component 7)(kg in a m^3 mixture)": "fine_aggregate_kg",
     "Age (day)": "age_day",
-    "Concrete compressive strength(MPa, megapascals)": "concrete_strength_mpa",
+    "Concrete compressive strength(MPa)": "concrete_strength_mpa",
 }
 
 MIX_FEATURE_COLUMNS: List[str] = [

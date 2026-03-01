@@ -8,3 +8,4 @@ shap
 streamlit
 requests
 openpyxl
+matplotlib

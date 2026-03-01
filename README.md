@@ -1,86 +1,62 @@
-# Precast Order Planning Dashboard
+# Industrial Concrete Multi-Objective Optimization (NSGA-II)
 
-This project provides a production planning system for precast operations using a trained concrete strength model.
+This project now includes a clean architecture for true multi-objective optimization:
 
-## Key behavior now
+- **f1:** Minimize total cost
+- **f2:** Minimize time to reach required strength
+- Subject to:
+  - Predicted strength ≥ required strength
+  - Water/Cement ratio within engineering limits
 
-1. **First run training only**
-   - The app/CLI trains a model from `concrete_data.xlsx` (or `.csv`) only when model artifact does not exist.
-   - Next runs load the saved model directly (no retraining during normal user flow).
+## Module Structure
 
-2. **Model-driven curing time**
-   - Finds actual minimum curing time needed to reach required strength.
-   - No 48-hour hard cap.
-   - Uses strict hour/day conversion (`1 day = 24 hours`).
+- `data_loader.py` - bounds/config/data utilities
+- `models.py` - Strength Model A, Strength Model B, combined predictor, cost/time models
+- `optimization.py` - pymoo NSGA-II problem/callback/plotting/logging
+- `evaluation.py` - feasible filtering, balanced selection, diagnostics
+- `main.py` - orchestration and outputs
 
-3. **Weather from latitude/longitude**
-   - Takes latitude + longitude as input.
-   - Calls Open-Meteo API for next 4 days from selected date.
-   - Uses average temperature and humidity from those 4 days.
+## Engineering Bounds
 
-4. **Yard-aware scheduling**
-   - Uses molds/day + yard-size occupancy constraints.
-   - Captures waiting behavior when yard is full.
+- Cement: 250–500 kg/m³
+- Water: 120–220 kg/m³
+- SCM: 0–200 kg/m³
+- Aggregates: 1200–2000 kg/m³
+- Temperature: 15–40°C
+- RH: 40–100%
+- Curing duration: 1–14 days
+- W/C ratio: 0.30–0.60
 
-5. **Three pathways output**
-   - Fastest
-   - Balanced
-   - Cheapest
-
-## Dataset schema expected
-
-- Cement (component 1)(kg in a m^3 mixture)
-- Blast Furnace Slag (component 2)(kg in a m^3 mixture)
-- Fly Ash (component 3)(kg in a m^3 mixture)
-- Water  (component 4)(kg in a m^3 mixture)
-- Superplasticizer (component 5)(kg in a m^3 mixture)
-- Coarse Aggregate  (component 6)(kg in a m^3 mixture)
-- Fine Aggregate (component 7)(kg in a m^3 mixture)
-- Age (day)
-- Concrete compressive strength(MPa, megapascals)
-
-## Streamlit app
+## Run
 
 ```bash
-streamlit run streamlit_app.py
+python main.py --required-strength 30 --population 80 --generations 60 --seed 42
 ```
 
-In the dashboard, provide:
-- units ordered
-- mold volume
-- mold area
-- completion days
-- required strength
-- latitude and longitude
-- order date
-- yard size available
-- molds produced per day
-- mix design values
+## Outputs
 
-The dashboard displays:
-- 4-day average weather used
-- pathway comparison table
-- completion-time chart
-- cost chart
-- planning logic
+- `optimization_log.txt` (full generation-by-generation logs)
+- `artifacts_optimization/decision_table.csv`
+- `artifacts_optimization/pareto_front.png`
+- `artifacts_optimization/objective_scatter.png`
+- `artifacts_optimization/optimization_summary.json`
 
-## CLI usage
+## Logging Transparency
+
+The optimizer logs:
+
+- population initialization and generation progression
+- objective values and constraint violations
+- feasible vs infeasible counts
+- Pareto front snapshots by generation
+- cheapest / fastest / balanced solution selection reasons
+- exact variable values and constraint margins for selected solutions
+- diagnostics: cost-time correlation, objective conflict, diversity metric
+
+## Dependencies
+
+Install with:
 
 ```bash
-python precast_nsga2_optimization.py \
-  --data concrete_data.xlsx \
-  --model-path artifacts/concrete_strength_age_model.joblib \
-  --units-ordered 20 \
-  --mold-volume 1.0 \
-  --mold-area 2.2 \
-  --required-strength 9 \
-  --completion-days 4 \
-  --latitude 13.0827 \
-  --longitude 80.2707 \
-  --date 2026-03-01 \
-  --yard-size 150 \
-  --molds-per-day 50 \
-  --mix-json '{"cement_kg":300,"blast_furnace_slag_kg":120,"fly_ash_kg":60,"water_kg":180,"superplasticizer_kg":8,"coarse_aggregate_kg":950,"fine_aggregate_kg":780}'
+pip install -r requirements.txt
 ```
-
-The command prints JSON with full input summary, climate averages, and all three recommended pathways.

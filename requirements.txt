@@ -5,7 +5,8 @@ joblib
 pymoo
 xgboost
 shap
-streamlit
+streamlit>=1.31,<2
+altair>=4.2.2,<5
 requests
 openpyxl
 matplotlib
